@@ -1,0 +1,10 @@
+name = wired_pier_cache
+description = Cache erdap data
+package = Explo Modules
+version = VERSION
+core = 7.x
+
+files[] = wired_pier_cache.drush.inc
+files[] = wired_pier_cache.install
+files[] = wired_pier_cache.module
+files[] = wired_pier_cache.admin.inc

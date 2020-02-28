@@ -1,0 +1,50 @@
+td.editable {
+  -webkit-touch-callout: none; /* iOS Safari */
+  -webkit-user-select: none;   /* Chrome/Safari/Opera */
+  -khtml-user-select: none;    /* Konqueror */
+  -moz-user-select: none;      /* Firefox */
+  -ms-user-select: none;       /* Internet Explorer/Edge */
+  user-select: none;           /* Non-prefixed version, currently
+                                  not supported by any browser */
+
+  cursor: cell;
+  white-space: pre;
+}
+td.editable,
+td.editable input,
+td.editable textarea {
+  cursor: cell;
+}
+
+td.editable.editing,
+td.editable.editing input,
+td.editable.editing textarea {
+  cursor: text;
+}
+td.editable.editing input,
+td.editable.editing textarea {
+  border-bottom: thin solid #333;
+  padding: 8px;
+}
+
+td.editable.saving {
+  opacity: 0.5;
+}
+td.editable.saving,
+td.editable.saving input,
+td.editable.saving textarea {
+  cursor: wait;
+  pointer-events: none;
+}
+td.editable[data-oid] {
+  background-color: rgba(250,204,82, 0.5);
+}
+/*  Range without overrides need to be styled differently  */
+td.editable[data-colmn="range_top"],
+td.editable[data-colmn="range_bottom"] {
+  color: #999;
+}
+td.editable[data-colmn="range_top"][data-oid],
+td.editable[data-colmn="range_bottom"][data-oid] {
+  color: inherit;
+}

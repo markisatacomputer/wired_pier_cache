@@ -1,0 +1,743 @@
+<?php
+/**
+ *
+ */
+
+define('ERDDAP', 'http://erddap.exploratorium.edu:8080/erddap/');
+define('WIRED_PIER_CACHE_DIR', 'public://wired-pier-data/');
+define('ERDDAP_META', 'tabledap/allDatasets.json');
+
+/**
+ *     Utilizes hook_menu
+ *       - register our admin page and ajax callbacks
+ */
+function wired_pier_cache_menu() {
+  $items['admin/datasets'] = array(
+    'title' => 'Datasets',
+    'description' => 'Find and manage content.',
+    'page callback' => 'wired_pier_cache_admin_datasets',
+    'access arguments' => array('admin datasets'),
+    'weight' => -10,
+    'file' => 'wired_pier_cache.admin.inc',
+  );
+  $items['admin/datasets/override'] = array(
+    'page callback' => 'wired_pier_cache_admin_ajax',
+    'type' => MENU_CALLBACK,
+    'access arguments' => array('admin datasets'),
+    'delivery callback' => 'wired_pier_cache_admin_ajax_callback',
+    'file' => 'wired_pier_cache.admin.inc',
+  );
+  $items['admin/datasets/datasets.json'] = array(
+    'page callback' => 'wired_pier_cache_dataset_paths',
+    'type' => MENU_CALLBACK,
+    'delivery callback' => 'wired_pier_cache_dataset_paths_json',
+  );
+  return $items;
+}
+function wired_pier_cache_permission() {
+  return array(
+    'admin datasets' => array(
+      'title' => t('Administer ERDDAP datasets'),
+      'description' => t('Make overrides and configuration changes to datasets imported from ERDDAP used in the Wired Pier Data Explorer.'),
+    ),
+  );
+}
+/**
+ * Implements hook_cron_queue_info().
+ */
+function wired_pier_cache_cron_queue_info() {
+  return array(
+    'wired-pier-cache-dataset' => array(
+      'worker callback' => 'wired_pier_cache_dataset_queue_worker',
+      'skip on cron' => TRUE,
+      'time' => 90,
+    ),
+  );
+}
+
+function wired_pier_cache_dataset_queue_worker($dataset) {
+   // save fields to db
+  wired_pier_cache_write_fields($dataset);
+  // save dataset to db
+  wired_pier_cache_write_dataset($dataset);
+  // export dataset json
+  $path = wired_pier_cache_export_dataset_json($dataset->datasetID);
+  // get field params
+  $field_params = wired_pier_cache_get_dataset_field_parameters($dataset->datasetID);
+
+  // limit to one year past and order by time
+  $parameters = '?' . $field_params . '&time%3E=' . urlencode(date("c",strtotime("-1 year"))) . '&distinct()&orderBy(%22time%22)';
+  //  get and save data from dataset as csv
+  if ($data = wired_pier_cache_ERDDAP_request('tabledap/' . $dataset->datasetID . '.csv' . $parameters )) {
+    //  tune frequency of data points
+    $path = WIRED_PIER_CACHE_DIR . $dataset->datasetID . '.csv.raw';
+    $file = file_save_data($data, $path, FILE_EXISTS_REPLACE);
+    if ($file !== false) {
+      if (function_exists('drush_print')) {
+        drush_print("Saved $path\n");
+      } else {
+        echo "Saved $path\n";
+      }
+      //  Optimize file - this won't work with drush/pantheon
+      wired_pier_cache_tune_sample_frequency($dataset->datasetID);
+    }
+  }
+}
+
+/**
+ *          Update the dataset cache files.
+ */
+function wired_pier_cache_update_cache($datasetID = NULL){
+  //  Get and save all dataset metadata from erddap
+  if ($all_datasets = wired_pier_cache_get_all_dataset_meta()) {
+    //  empty the queue - just in case
+    $queue = DrupalQueue::get('wired-pier-cache-dataset');
+    while ($item = $queue->claimItem()) {
+      $queue->deleteItem($item);
+    }
+    //  Add to queue
+    foreach ($all_datasets as $key => $dataset) {
+      //  Add only datasetID if set
+      if (isset($datasetID)  && $datasetID == $dataset->datasetID) {
+        if (function_exists('drush_print')) { drush_print("Adding $datasetID to cache update queue."); }
+        $queue->createItem($dataset);
+      //  otherwise add all
+      } else if (!isset($datasetID)) {
+        if (function_exists('drush_print')) { drush_print("Adding $dataset->datasetID to cache update queue."); }
+        $queue->createItem($dataset);
+      }
+    }
+  }
+}
+/**
+ *          Update the current conditions json cache files.
+ */
+function wired_pier_cache_update_current_conditions_cache(){
+  //  Get and save all dataset metadata from erddap
+  if ($all_datasets = wired_pier_cache_get_all_dataset_meta()) {
+    foreach ($all_datasets as $key => $dataset) {
+      // get field params
+      $field_params = wired_pier_cache_get_dataset_field_parameters($dataset->datasetID);
+      // limit to one year past and order by time
+      $parameters = '?' . $field_params . '&time%3E=' . urlencode(date("c",strtotime("-1 day"))) . '&orderBy(%22time%22)';
+      //  get and save data from dataset as json
+      if ($data = wired_pier_cache_ERDDAP_request('tabledap/' . $dataset->datasetID . '.json' . $parameters )) {
+        $path = WIRED_PIER_CACHE_DIR . $dataset->datasetID . '.current.json';
+        $file = file_save_data($data, $path, FILE_EXISTS_REPLACE);
+        if ($file !== false) {
+          if (function_exists('drush_print')) {
+            drush_print("Saved $path" . "\n");
+          }
+        }
+      }
+    }
+  }
+}
+/**
+ * Tune the frequency of data points in a dataset cache file
+ * @param  string  $datasetID The ID of the dataset which we're tuning
+ * @param  integer $frequency The maxium (ish) number of data points per hour
+ * @param  string  $file_ext  The file extension of the dataset cache file
+ * @return [type]             Returns true on success, false on error.
+ */
+function wired_pier_cache_tune_sample_frequency($datasetID, $frequency = 10, $file_ext = '.csv') {
+  //  set some limits
+  $sample_hours_max = 15;
+  $sample_hours_min = 3;
+  $sample_rows_max = 500;
+  //  open cache file
+  $path =  WIRED_PIER_CACHE_DIR . $datasetID . $file_ext;
+  $path_raw = $path . '.raw';
+  if (is_file($path_raw) && is_readable($path_raw) && is_writable($path_raw)) {
+    $file = new SplFileObject($path_raw, 'r');
+    $file->setFlags(SplFileObject::READ_CSV | SplFileObject::READ_AHEAD | SplFileObject::SKIP_EMPTY | SplFileObject::DROP_NEW_LINE);
+    //  track some things for our conditions
+    $row_num = 1;
+    $still_sampling = true;
+    $sample_hours = array();
+    //  loop through file rows
+    while (($row = $file->fgetcsv()) !== false && $still_sampling) {
+      //  get time index
+      if ($row_num == 1) {
+        $time_index = array_flip($row)['time'];
+      }
+      if ($row_num > 2) {
+        //  get this rows time data
+        $time = wired_pier_cache_transform_row_to_time_info($row, $time_index);
+        //  advance past first set of set of data points within a unique hour - shouldn't use this in our sample
+        if ($row_num == 3) {
+          $initial_hour = $time['hours'];
+        //  get our samples - how many data points per hour
+        } else if (($row_num > 3) && (($time['hours'] !== $initial_hour)) && (count($sample_hours) < $sample_hours_max) ) {
+          if (!isset($sample_hours[$time['hours']])) {
+            $sample_hours[$time['hours']] = 1;
+          } else {
+            $sample_hours[$time['hours']]++;
+          }
+        //  we're done sampling.  let's exit.
+        } else if (($row_num > 3) && ($time['hours'] !== $initial_hour)) {
+          $still_sampling = false;
+        }
+      }
+      //  stop things if we're spending too much time taking a sample
+      if ((($row_num > $sample_rows_max) && (count($sample_hours) > $sample_hours_min)) || $file->eof()) {
+        $still_sampling = false;
+      }
+      $row_num++;
+    }
+
+    //  We're done sampling
+    //  First remove the final sample - might not be complete
+    array_pop($sample_hours);
+    //  Take the average
+    $average = array_sum($sample_hours)/count($sample_hours);
+    //  Calculate which lines to save.
+    $save_every = round($average/$frequency);
+    //  Communicate
+    if (function_exists('drush_print')) { drush_print("Data collection average: $average data points per hour."); }
+    //  Is it greater than our target average?  If not, exit.
+    if ($average <= $frequency || $save_every == 1) {
+      //  Remove file from memory
+      $file = null;
+      //  Communicate
+      if (function_exists('drush_print')) { drush_print("No need to optimize $datasetID$file_ext."); }
+      //  Move raw file to final path
+      rename($path_raw, $path);
+      //  Exit with success
+      return true;
+    } else {
+    //  If so, we need to cherry pick rows from the entire dataset.
+      //  Communicate
+      if (function_exists('drush_print')) { drush_print("Writing optimized cache file...  \nWe will save every $save_every th row."); }
+      //  Start at the beginning
+      $file = null;
+      $file = explode("\n", file_get_contents($path_raw));
+      //  Save headers
+      $optimized_array = array($file[0], $file[1]);
+      //  Save every Nth line
+      $key = 3;
+      while (($key >= 3)  && $key <= count($file)) {
+        array_push($optimized_array, $file[$key]);
+        $key = $key + $save_every;
+      }
+
+      file_put_contents($path . '.optimized', implode("\n", $optimized_array));
+
+      //  Communicate
+      $start_size = filesize($path_raw);
+      $end_size = filesize($path . '.optimized');
+      $reduction  = round((($start_size-$end_size)/$start_size)*100);
+      $start_size = wired_pier_cache_human_filesize($start_size);
+      $end_size = wired_pier_cache_human_filesize($end_size);
+      if (function_exists('drush_print')) { drush_print("Complete. \nPrevious file size: $start_size bytes. \nNew file size: $end_size bytes. \n$reduction% file size reduction."); }
+
+      //  Overwrite old file and remove temp file
+      file_put_contents($path,  implode("\n", $optimized_array));
+      unlink($path . '.optimized');
+      unlink($path_raw);
+      //  remove files from memory
+      $file = $optimized = null;
+      return true;
+    }
+  }
+  //  If we've made it here there was a problem.  Exit with failure.
+  return false;
+}
+
+/**
+ * Take one row from a dataset cache file and find it's timestamp info
+ * @param  array  $row         One row of data
+ * @param  integer $time_index The index where a timestamp can be found
+ * @return array               Returns an array - results of php function getdate
+ */
+function wired_pier_cache_transform_row_to_time_info($row, $time_index = 0) {
+  $row = $row[$time_index];
+  $row = strtotime($row);
+  $time = getdate($row);
+  return $time;
+}
+/**
+ * Convert bytes to human readable descriptions - from http://jeffreysambells.com/2012/10/25/human-readable-filesize-php
+ * @param  integer  $bytes    Number of bytes
+ * @param  integer $decimals  Decimal places to include
+ * @return string             Human readable size string
+ */
+function wired_pier_cache_human_filesize($bytes, $decimals = 2) {
+  $size = array('B','kB','MB','GB','TB','PB','EB','ZB','YB');
+  $factor = floor((strlen($bytes) - 1) / 3);
+  return sprintf("%.{$decimals}f", $bytes / pow(1024, $factor)) . @$size[$factor];
+}
+
+/**
+ * Get all dataset metadata from ERDDAP
+ * @return array Dataset objects complete with field info
+ */
+function wired_pier_cache_get_all_dataset_meta() {
+  //  Get all dataset metadata
+  $meta = wired_pier_cache_ERDDAP_request(ERDDAP_META, false);
+  if ($meta !== false) {
+    //  convert meta to iterable array
+    $meta = json_decode($meta);
+    $allDS = array();
+    foreach ($meta->table->rows as $row => $dataset) {
+      // do not include allDatasets meta
+      if ($dataset[0] != 'allDatasets') {
+        /**
+         *   get dataset meta
+         */
+        $DS_array = array();
+        foreach ($dataset as $column => $value) {
+          $DS_array[$meta->table->columnNames[$column]] = $value;
+        }
+        /**
+         *    get field meta
+         */
+        $DS_meta = wired_pier_cache_ERDDAP_request('info/' . $DS_array['datasetID'] . '/index.json', false);
+        if ($DS_meta !== false) {
+          $DS_meta = json_decode($DS_meta);
+          //  map column indexes to variables
+          foreach (array_flip($DS_meta->table->columnNames) as $key => $value){
+            $name = strtolower(str_replace(' ', '_',$key));
+            $$name = $value;
+          }
+          $fields = array();
+          foreach ($DS_meta->table->rows as $index => $row) {
+            // map row to values
+            $name   = $row[$variable_name];
+            $column_name = $row[$attribute_name];
+            $type   = $row[$row_type];
+            $val    = $row[$value];
+            //  variable type rows are just the field name
+            if ($type == 'variable') {
+              //  save last field
+              if (isset($field) && is_array($field) && count($field) > 0) {
+                //  !important - use previous name not new name
+                $last_name = $DS_meta->table->rows[$index-1][$variable_name];
+                $fields[$last_name] = (object) $field;
+              }
+              //  start a new field
+              $field = array();
+            }
+            if ($type == 'attribute') {
+              // extra meta for dataset
+              if ( $name == 'NC_GLOBAL' && $type == 'attribute') {
+                $DS_array[$column_name] = $val;
+              // field meta - exclude time field
+              } else if ($name != 'time') {
+                // variable row - last field is done.  push it into dataset metadata
+                $field[$column_name] = $val;
+                // final row - push last field into dataset meta
+                if ($index == count($DS_meta->table->rows) && isset($field) && is_array($field) && count($field) > 0) {
+                  $fields[$name] = (object) $field;
+                }
+              }
+            }
+
+          }
+          // set fields as object
+          $DS_array['fields'] = (object) $fields;
+        }
+
+        $allDS[] = (object) $DS_array;
+      }
+    }
+    return $allDS;
+  }
+  return false;
+}
+/**
+ * Given a dataset object, write all fields to DB
+ * @param  stdClass $dataset A dataset object created by function wired_pier_cache_get_all_dataset_meta
+ * @return NULL
+ */
+function wired_pier_cache_write_fields($dataset) {
+  $values_insert = array();
+  $values_update = array();
+  foreach ($dataset->fields as $fieldID => $field) {
+    // do not include if no id or name
+    if (!empty($fieldID) && !empty($field->long_name)) {
+      // map range values
+      if (!empty($field->actual_range)) {
+        list($range_bottom , $range_top) = explode(', ', $field->actual_range);
+      }
+      // construct field array for db query
+      $field_array = array(
+        'datasetID' => $dataset->datasetID,
+        'fieldID' => $fieldID,
+        'displayName' => $field->long_name,
+        'category' => ($field->ioos_category) ? $field->ioos_category : '',
+        'displayUnits' => ($field->units) ? $field->units : '',
+        'range_bottom' => ($range_bottom) ? $range_bottom : 0,
+        'range_top' => ($range_top) ? $range_top : 0,
+      );
+      // check to see if this field exists
+      if ($existing = db_select('wired_pier_dataset_field', 'f')
+      ->fields('f', array('fid'))
+      ->condition('datasetID', $dataset->datasetID)
+      ->condition('fieldID', $fieldID)
+      ->execute()
+      ->fetchAssoc()) {
+        $values_update[] = $field_array;
+      } else {
+        $values_insert[] = $field_array;
+      }
+    }
+  }
+  //  Insert
+  if (count($values_insert) > 0) {
+    $query = db_insert('wired_pier_dataset_field')
+      ->fields(array('datasetID', 'fieldID', 'displayName', 'category', 'displayUnits', 'range_bottom', 'range_top'));
+    foreach ($values_insert as $record) {
+        $query->values($record);
+    }
+    $query->execute();
+  }
+
+  //  Update
+  if (count($values_update) > 0) {
+    foreach ($values_update as $record) {
+      $datasetID = $record['datasetID'];
+      $fieldID = $record['fieldID'];
+      //  don't write to datasetID or fieldID columns on update
+      unset($record['datasetID'], $record['fieldID']);
+      $query = db_update('wired_pier_dataset_field')
+        ->fields($record)
+        ->condition('datasetID', $datasetID)
+        ->condition('fieldID', $fieldID)
+        ->execute();
+    }
+  }
+}
+/**
+ * Write dataset object to drupal db
+ * @param  stdClass $dataset dataset object created by wired_pier_cache_get_all_dataset_meta
+ * @return stdClass          altered dataset object
+ */
+function wired_pier_cache_write_dataset($dataset) {
+  //  don't keep fields - these will always come from db
+  unset($dataset->fields);
+  //  add timestamp for cache busting
+  $dataset->timestamp = time();
+  // check to see if this field exists
+  if ($existing = db_select('wired_pier_dataset', 'd')
+  ->fields('d', array('dsid'))
+  ->condition('datasetID', $dataset->datasetID)
+  ->execute()
+  ->fetchAssoc()) {
+    //  Update
+    $query = db_update('wired_pier_dataset')
+      ->fields(array('object' => json_encode($dataset, JSON_UNESCAPED_SLASHES)))
+      ->condition('datasetID', $dataset->datasetID)
+      ->execute();
+  } else {
+    //  Insert
+    $query = db_insert('wired_pier_dataset')
+      ->fields(array(
+        'object' => json_encode($dataset, JSON_UNESCAPED_SLASHES),
+        'datasetID' => $dataset->datasetID,
+        'path' => $path = wired_pier_cache_create_url(WIRED_PIER_CACHE_DIR . $dataset->datasetID . '.csv')))
+      ->execute();
+  }
+  return $dataset;
+}
+/**
+ * Export cached dataset object and dataset fields to static file.
+ * Cache is taken from database.  This will be called after cron writes to DB and after admin pages write to DB.
+ * @param  string $datasetID unique dataset ID
+ * @return string            absolute local public url to file written
+ */
+function wired_pier_cache_export_dataset_json($datasetID) {
+  if ($dataset = db_select('wired_pier_dataset', 'd')
+  ->fields('d', array('object', 'path','description', 'discontinuity'))
+  ->condition('datasetID', $datasetID)
+  ->execute()
+  ->fetchAssoc()) {
+    //  add all dataset attributes from ERDDAP
+    $export = json_decode($dataset['object']);
+    //  remove empty values
+    foreach ($export as $key => $value) {
+      if (empty($value)) {
+        unset($export->{$key});
+      }
+    }
+    //  add path and type
+    if (isset($dataset['path'])) {
+      $export->type = "url";
+      $export->path = $dataset['path'] . '?time=' . time();
+    }
+    //  add discontinuity
+    if (isset($dataset['discontinuity'])) {
+      $export->discontinuity = json_decode($dataset['discontinuity']);
+    }
+    //  add description
+    if (isset($dataset['description'])) {
+      $export->description = $dataset['description'];
+    }
+    if ($fields = wired_pier_cache_get_dataset_fields($datasetID)) {
+      $export->fields = new stdClass();
+      foreach ($fields as $fid => $field) {
+        $fieldID = $field->fieldID;
+        $export->fields->{$fieldID} = new stdClass();
+        foreach ($field as $key => $value) {
+          switch ($key) {
+            case 'fieldID':
+              break;
+            case 'datasetID':
+              break;
+            case 'fid':
+              break;
+            case 'range_top':
+              $range_top = 0;
+              if (isset($value) && is_numeric($value)) {
+                $range_top = $value;
+              }
+              break;
+            case 'range_bottom':
+              if (isset($value) && $value < $range_top && isset($field->oid['range_top']) && isset($field->oid['range_bottom']) && is_numeric($value)) {
+                $export->fields->{$fieldID}->filter = new stdClass();
+                $export->fields->{$fieldID}->filter->type = 'range';
+                $export->fields->{$fieldID}->filter->args = (object) array('from' => $value, 'to' => $range_top);
+              }
+              break;
+            case 'area':
+              $export->fields->{$fieldID}->area = boolval($value);
+              break;
+            case 'enabled':
+              $export->fields->{$fieldID}->include = boolval($value);
+              break;
+            default:
+              if ($value !== null && $value !== '') {
+                $export->fields->{$fieldID}->{$key} = $value;
+              }
+              break;
+          }
+        }
+      }
+      $path = WIRED_PIER_CACHE_DIR . $datasetID . '.json';
+      $file = file_save_data(json_encode($export, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT), $path, FILE_EXISTS_REPLACE);
+      if ($file !== false) {
+        if (function_exists('drush_print')) {
+          drush_print("Saved $path" . "\n");
+        }
+        return $path;
+      }
+    }
+  }
+  return false;
+}
+/**
+ * Send http request to ERDDAP and return data
+ * @param  string  $endpoint Valid ERDDAP URL
+ * @param  boolean $scrub    When true scrub data of "NaN"
+ * @return string            data response from ERDDAP or false on fail.
+ */
+function wired_pier_cache_ERDDAP_request($endpoint = 'tabledap/explorebeaconbay5min.csv?time,CO2,Temperature_3', $scrub = true) {
+  if (function_exists('drush_print')) {
+    drush_print('Sending request: ' . ERDDAP . $endpoint);
+  }
+  // send request
+  $response = drupal_http_request(ERDDAP . $endpoint, array('timeout' => 160));
+  //  in case of error log and exit
+  if (isset($response->error)) {
+    watchdog('wired_pier_cache', $endpoint . '  ::  HTTP Error: ' . $response->error, array(), WATCHDOG_ERROR, 'link');
+    return false;
+  }
+  // send data
+  if (!empty($response->data) && $scrub) {
+    return str_replace("NaN", '', $response->data);
+  } else if (!empty($response->data)) {
+    return $response->data;
+  }
+  // if no data
+  return false;
+}
+/**
+ * Merge all overriden field values from db table wired_pier_dataset_field_override
+ *    with default field values from db table wired_pier_dataset_field
+ * @return array          field objects keyed by fid
+ */
+function wired_pier_cache_get_all_fields($enabled = false) {
+  //  get fields
+  $query = db_select('wired_pier_dataset_field', 'f')
+  ->fields('f')
+  ->orderBy('datasetID', 'DESC')
+  ->orderBy('fieldID', 'DESC');
+  //  filter by enabled
+  if ($enabled) {
+    $query->join('wired_pier_dataset', 'ds', 'f.datasetID = ds.datasetID');
+    $query->condition('f.enabled', 1);
+    $query->condition('ds.enabled', 1);
+    $query->condition('f.datasetID', wired_pier_cache_get_dataset_cache_exists());
+  }
+  if ($fields = $query->execute()->fetchAllAssoc('fid')) {
+    //  get overrides
+    if ($overrides = db_select('wired_pier_dataset_field_override', 'o')
+    ->fields('o')
+    ->orderBy('fid', 'DESC')
+    ->execute()) {
+      return wired_pier_cache_merge_overriden($fields, $overrides);
+    }
+  }
+  //  return absolute failure
+  return false;
+}
+/**
+ * Return datasetID's for only those datasets that have a corresponding cache file saved.  Used by wired_pier_cache_get_all_fields to ensure Data Explorer layer list only displays layers for which there is data.
+ * @param  string $extension   file extension to search for
+ * @return array               Array of datasetIDs
+ */
+function wired_pier_cache_get_dataset_cache_exists($extension = '.csv') {
+  //  get datasets
+  if ($datasets = db_select('wired_pier_dataset', 'ds')
+  ->fields('ds', array('datasetID'))
+  ->orderBy('datasetID', 'DESC')
+  ->condition('enabled', 1)
+  ->execute()
+  ->fetchAllAssoc('datasetID')) {
+    foreach ($datasets as $datasetID => $value) {
+      if (!file_exists(WIRED_PIER_CACHE_DIR . $datasetID . $extension)) {
+        unset($datasets[$datasetID]);
+      }
+    }
+    return array_keys($datasets);
+  }
+}
+
+function wired_pier_cache_get_dataset_diplay_names() {
+  //  get datasets
+  if ($datasets = db_select('wired_pier_dataset', 'ds')
+  ->fields('ds', array('datasetID', 'displayName'))
+  ->orderBy('datasetID', 'DESC')
+  ->condition('enabled', 1)
+  ->execute()
+  ->fetchAllAssoc('datasetID')) {
+    return $datasets;
+  }
+  //  return absolute failure
+  return false;
+}
+
+/**
+ * The same as @function wired_pier_cache_get_all_fields but restricted to one dataset.
+ *     Used by @function wired_pier_cache_export_dataset_json in exporting dataset.json config files
+ * @param  string           $datasetID unique dataset ID
+ * @return array            field objects keyed by fid
+ */
+function wired_pier_cache_get_dataset_fields($datasetID, $enabled = false) {
+  //  build query
+  $query = db_select('wired_pier_dataset_field', 'f')
+  ->fields('f')
+  ->orderBy('datasetID', 'DESC')
+  ->orderBy('fieldID', 'DESC')
+  ->condition('datasetID', $datasetID);
+  //  filter by enabled
+  if ($enabled) {
+    $query->condition('enabled', 1);
+  }
+  if ($fields = $query->execute()->fetchAllAssoc('fid')) {
+    //  get overrides
+    if ($overrides = db_select('wired_pier_dataset_field_override', 'o')
+    ->fields('o')
+    ->condition('fid', array_keys($fields), 'IN')
+    ->orderBy('fid', 'DESC')
+    ->execute()) {
+      return wired_pier_cache_merge_overriden($fields, $overrides);
+    }
+  }
+  //  return absolute failure
+  return false;
+}
+
+function wired_pier_cache_get_dataset_field_parameters($datasetID) {
+  $fields = wired_pier_cache_get_dataset_fields($datasetID, true);
+  $param_str = '';
+  if (!empty($fields)) {
+    //  Put params together in string
+    foreach ($fields as $id => $field) {
+      if ($field->fieldID != 'NC_GLOBAL') {
+        $param_str .= $field->fieldID . ',';
+      }
+    }
+    //  Remove final comma
+    $param_str = substr($param_str, 0, strlen($param_str) - 1);
+    //  Add initial comma
+    if (strlen($param_str) > 0) {
+      $param_str = 'time,' . $param_str;
+    }
+  }
+
+  return $param_str;
+}
+/**
+ * Merge values from two database queries into one result array with values
+ * @param  array  $fields    field value objects
+ * @param  array  $overrides values which will override
+ * @return array             field value objects with overriden values replaced
+ */
+function wired_pier_cache_merge_overriden($fields, $overrides) {
+  //  push overrides into fields
+  foreach ($overrides as $record) {
+    //  override value
+    $fields[$record->fid]->{$record->colmn} = $record->value;
+    //  store oid for rendering
+    if (!isset($fields[$record->fid]->oid)) {
+      $fields[$record->fid]->oid = array();
+    }
+    $fields[$record->fid]->oid[$record->colmn] = $record->oid;
+  }
+  //  return sucessfully merged fields
+  return $fields;
+}
+/**
+ * Create a absolute (without uri) url from a drupal stream uri
+ * @param  String $uri drupal stream uri
+ * @return String      Empty on fail.  url on success.  eg. "/sites/default/files/wired_pier_data/testing.json"
+ */
+function wired_pier_cache_create_url($uri = null) {
+  if (isset($uri)) {
+    $scheme = file_uri_scheme($uri);
+    if ($scheme) {
+      if ($wrapper = file_stream_wrapper_get_instance_by_uri($uri)) {
+        $path = file_uri_target($uri);
+        return '/' . $wrapper->getDirectoryPath() . '/' . drupal_encode_path($path);
+      }
+    }
+  }
+  return '';
+}
+
+function wired_pier_cache_dataset_paths() {
+  $datasets = db_select('wired_pier_dataset', 'ds');
+  $datasets->join('wired_pier_dataset_field', 'f', 'ds.datasetID = f.datasetID');
+  if ($result = $datasets
+    ->fields('ds', array('datasetID', 'object'))
+    //  only enabled include enabled datasets having enabled fields
+    ->where('ds.enabled = :bool', array(':bool' =>1))
+    ->where('f.enabled = :bool', array(':bool' =>1))
+    ->orderBy('ds.datasetID', 'DESC')
+    ->distinct()
+    ->execute()
+    ) {
+      //  only include datasets that have data in the past year
+      $config_files = array();
+      foreach ($result as $datasetID => $dataset) {
+        $dataset_obj = json_decode($dataset->object);
+        $path = wired_pier_cache_create_url(WIRED_PIER_CACHE_DIR . $dataset->datasetID . '.json');
+        //  add cache busting var for config file paths
+        if (isset($dataset_obj->timestamp)) {
+          $path .= "?time=" . $dataset_obj->timestamp;
+        }
+        $data_path = DRUPAL_ROOT . wired_pier_cache_create_url(WIRED_PIER_CACHE_DIR . $dataset->datasetID . '.csv');
+        //  Only add to array if the data file exists
+        if (file_exists($data_path)) {
+          $config_files[] = $path;
+        }
+      }
+      return $config_files;
+    }
+}
+function wired_pier_cache_dataset_paths_json($configs) {
+  drupal_add_http_header('Content-Type', 'application/json');
+  $configs = wired_pier_cache_dataset_paths();
+  print json_encode($configs, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+}

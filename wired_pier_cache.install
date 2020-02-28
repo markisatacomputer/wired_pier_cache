@@ -1,0 +1,231 @@
+<?php
+/**
+ * Implements hook_install().
+ *
+ *    Make sure data directory exists on install
+ */
+function wired_pier_cache_install() {
+  $folder = WIRED_PIER_CACHE_DIR;
+  if (file_prepare_directory($folder, FILE_CREATE_DIRECTORY)) {
+    watchdog('wired_pier_cache', 'wired-pier-data directory created', array(), WATCHDOG_NOTICE);
+    //  write cache initially
+    wired_pier_cache_update_cache();
+    //  write current conditions cache initially
+    wired_pier_cache_update_current_conditions_cache();
+  } else {
+    watchdog('wired_pier_cache', 'error creating wired-pier-data directory', array(), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Implements hook_schema().
+ */
+function wired_pier_cache_schema() {
+  $schema['wired_pier_dataset'] = array(
+    'description' => 'Stores ERDDAP datasets',
+    'fields' => array(
+      'dsid' => array(
+        'description' => 'The primary identifier for a field.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'datasetID' => array(
+        'description' => 'The primary identifier for a dataset.',
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'path' => array(
+        'description' => 'File path to dataset data cached from ERDDAP.',
+        'type' => 'text',
+        'size' => 'medium',
+      ),
+      'displayName' => array(
+        'description' => 'The name of a dataset.',
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'description' => array(
+        'description' => 'The description of a dataset.',
+        'type' => 'text',
+        'size' => 'medium',
+      ),
+      'discontinuity' => array(
+        'description' => 'Discontinuity attribute.',
+        'type' => 'text',
+        'size' => 'medium',
+      ),
+      'object' => array(
+        'description' => 'The dataset object.',
+        'type' => 'text',
+        'size' => 'medium',
+      ),
+      'extra_object' => array(
+        'description' => 'JSON representation of any extra attributes to be added to dataset metadata through admin.',
+        'type' => 'text',
+        'size' => 'medium',
+      ),
+      'enabled' => array(
+        'description' => 'Whether or not the field will appear on the timeseries graph.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => TRUE,
+      ),
+    ),
+    'unique keys' => array(
+      'datasetID' => array('datasetID'),
+    ),
+    'primary key' => array('dsid'),
+  );
+  $schema['wired_pier_dataset_field'] = array(
+    'description' => 'Stores ERDDAP dataset fields.',
+    'fields' => array(
+      'fid' => array(
+        'description' => 'The primary identifier for a field.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'datasetID' => array(
+        'description' => 'The primary identifier for a dataset.',
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'fieldID' => array(
+        'description' => 'The text identifier for a field.',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'displayName' => array(
+        'description' => 'The name of a field according to ERDDAP.',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'description' => array(
+        'description' => 'The description of a dataset field.',
+        'type' => 'text',
+        'size' => 'medium',
+      ),
+      'range_bottom' => array(
+        'description' => 'Low end of range',
+        'type' => 'float',
+        'size' => 'big',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'range_top' => array(
+        'description' => 'Top end of range',
+        'type' => 'float',
+        'size' => 'big',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'category' => array(
+        'description' => 'The category a field.',
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'displayUnits' => array(
+        'description' => 'The unit of measurement for a field.',
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'color' => array(
+        'description' => 'The hex color value for drawing a field on the timeseries graph.',
+        'type' => 'varchar',
+        'length' => 7,
+        'not null' => TRUE,
+        'default' => '#000000',
+      ),
+      'area' => array(
+        'description' => 'Whether or not the field will appear as an area on the timeseries graph.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'enabled' => array(
+        'description' => 'Whether or not the field will appear on the timeseries graph.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => TRUE,
+      ),
+    ),
+    'indexes' => array(
+      'fid' => array('fid'),
+      'datasetID' => array('datasetID'),
+      'fieldID' => array('fieldID'),
+    ),
+    'unique keys' => array(
+      'dataset_field_ID' => array('datasetID', 'fieldID'),
+    ),
+    'primary key' => array('fid'),
+  );
+  $schema['wired_pier_dataset_field_override'] = array(
+    'description' => 'Stores configuration overrides for ERDDAP',
+    'fields' => array(
+      'oid' => array(
+        'description' => 'The primary identifier for a field override.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'fid' => array(
+        'description' => 'The primary identifier for a field.',
+        'type' => 'varchar',
+        'length' => 64,
+        'not null' => TRUE,
+      ),
+      'colmn' => array(
+        'description' => 'The key of the overriden field.',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+      ),
+      'value' => array(
+        'description' => 'The value of the overriden field.',
+        'type' => 'text',
+        'size' => 'medium',
+      ),
+    ),
+    'indexes' => array(
+      'fid' => array('fid'),
+    ),
+    'unique keys' => array(
+      'fid_colmn' => array('fid', 'colmn'),
+    ),
+    'primary key' => array('oid'),
+  );
+
+  return $schema;
+}
+
+/**
+ * Add the cache_wired_pier_dataset and wired_pier_dataset_fields tables.
+ */
+function wired_pier_cache_update_7000() {
+  if (!db_table_exists('wired_pier_dataset')) {
+    $schema = drupal_get_schema_unprocessed('wired_pier_cache', 'wired_pier_dataset');
+    db_create_table('wired_pier_dataset', $schema);
+  }
+  if (!db_table_exists('wired_pier_dataset_field')) {
+    $schema = drupal_get_schema_unprocessed('wired_pier_cache', 'wired_pier_dataset_field');
+    db_create_table('wired_pier_dataset_field', $schema);
+  }
+}
